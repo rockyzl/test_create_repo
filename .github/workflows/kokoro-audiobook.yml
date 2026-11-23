@@ -1,0 +1,100 @@
+name: Generate Kokoro Audiobook
+on:
+  push:
+    branches: [kokoro-audio-run-20261122]
+  workflow_dispatch:
+jobs:
+  audiobook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Install speech dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq espeak-ng ffmpeg
+          python -m pip install -q --upgrade pip
+          python -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -q "kokoro>=0.9.2" soundfile numpy
+      - name: Generate audiobook directly from existing public English site
+        run: |
+          python - <<'PY'
+          import html, json, os, pathlib, re, subprocess, urllib.request
+          import numpy as np
+          import soundfile as sf
+          from kokoro import KPipeline
+          
+          SITE = "https://headless-vqybxjmjvgx-zhanglu77-1409.wix-site-host.com"
+          ROOT = pathlib.Path("audio-output")
+          ROOT.mkdir(parents=True, exist_ok=True)
+          VOICE = "af_heart"
+          SPEED = 0.96
+          RATE = 24000
+          
+          with urllib.request.urlopen(urllib.request.Request(SITE, headers={"User-Agent": "Mozilla/5.0"}), timeout=45) as response:
+              page = response.read().decode("utf-8")
+          article_re = re.compile(r'<article class="chapter-card" id="chapter-(\d+)"[\s\S]*?<h3>(.*?)</h3>[\s\S]*?<div class="transcript"[^>]*>([\s\S]*?)</div>')
+          chapters = []
+          for m in article_re.finditer(page):
+              paragraphs = [html.unescape(re.sub(r"<[^>]+>", "", p)).strip() for p in re.findall(r"<p>([\s\S]*?)</p>", m.group(3))]
+              chapters.append({"id": int(m.group(1)), "title": html.unescape(m.group(2)), "paragraphs": paragraphs})
+          assert len(chapters) == 9 and all(len(c["paragraphs"]) >= 7 for c in chapters), "Missing or malformed source chapters"
+          print("Downloaded original educational scripts:", [(c["id"], c["title"], len(c["paragraphs"])) for c in chapters], flush=True)
+          
+          pipeline = KPipeline(lang_code="a")
+          def speech(text):
+              pieces = []
+              for item in pipeline(text, voice=VOICE, speed=SPEED, split_pattern=r"\n+"):
+                  audio = item.audio if hasattr(item, "audio") else item[2]
+                  if hasattr(audio, "detach"):
+                      audio = audio.detach().cpu().numpy()
+                  parts = np.asarray(audio, dtype="float32").flatten()
+                  if len(parts):
+                      pieces.append(parts)
+              if not pieces:
+                  raise RuntimeError("Kokoro returned no audio for text: " + text[:70])
+              return np.concatenate(pieces)
+          
+          def mp3(arr, name):
+              temporary = ROOT / (name + ".wav")
+              sf.write(str(temporary), arr, RATE)
+              subprocess.run(["ffmpeg","-y","-hide_banner","-loglevel","error","-i",str(temporary),"-codec:a","libmp3lame","-b:a","128k",str(ROOT/(name+".mp3"))],check=True)
+              temporary.unlink()
+          
+          sample = speech(chapters[0]["paragraphs"][0])
+          mp3(sample, "00-voice-preview")
+          print("Voice preview finished:", len(sample)/RATE, "seconds", flush=True)
+          combined = []
+          manifest = []
+          current = 0
+          for c in chapters:
+              audio_pieces = []
+              for i, piece in enumerate([c["title"]+"."] + c["paragraphs"]):
+                  audio_pieces.append(speech(piece))
+                  if i < len(c["paragraphs"]):
+                      audio_pieces.append(np.zeros(int(RATE * .35), dtype=np.float32))
+              chapter_audio = np.concatenate(audio_pieces)
+              chapter_name = f'{c["id"]:02d}-'+re.sub(r'[^a-z0-9]+','-',c["title"].lower()).strip('-')
+              mp3(chapter_audio, chapter_name)
+              duration = len(chapter_audio) / RATE
+              manifest.append({"id":c["id"],"title":c["title"],"start":round(current,2),"duration":round(duration,2),"file":chapter_name+".mp3"})
+              combined.append(chapter_audio)
+              current += duration
+              if c["id"] != 9:
+                  gap = np.zeros(int(RATE*1.5),dtype=np.float32)
+                  combined.append(gap)
+                  current += 1.5
+              print(f'CHAPTER {c["id"]}/9 finished: {duration:.1f}sec',flush=True)
+          mp3(np.concatenate(combined), "a-little-space-kokoro-full")
+          (ROOT/"chapters-timing.json").write_text(json.dumps({"voice":VOICE,"speed":SPEED,"chapters":manifest},indent=2))
+          print("COMPLETE: nine chapters",flush=True)
+          PY
+      - name: Upload MP3 audiobook and timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-little-space-kokoro-audiobook
+          path: audio-output/
+          if-no-files-found: warn
+          retention-days: 7
