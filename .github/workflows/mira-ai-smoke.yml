@@ -41,6 +41,8 @@ jobs:
               expect(status==403,"requires consent",f"status={status}")
               status,doc=send("/chat",{"message":"I want to kill myself","adult":True,"consent":True})
               expect(status==200 and doc.get("safety")=="crisis" and "988" in doc.get("reply",""),"crisis short circuit",f"status={status}")
+              status,doc=send("/chat",{"message":"I hope I don't wake up tomorrow","adult":True,"consent":True})
+              expect(status==200 and doc.get("safety")=="crisis","passive-harm phrasing",f"status={status}")
               for label,text in [
                 ("family reflection","I feel angry when family plans are made without telling me. What is a small next step?"),
                 ("hearing boundary","What does Hearing Boundary mean when someone judges my motives?")
